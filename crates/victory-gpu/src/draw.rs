@@ -172,18 +172,19 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 /// Whether `index` holds `address` on the host already, or has been mirrored
 /// this frame; a root descriptor reaches the same slot from every draw.
-fn mirror_once(index: u32, address: u64) -> bool {
+fn mirror_once(heap: usize, index: u32, address: u64) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<(u64, HashSet<(u32, u64)>)>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new((0, HashSet::new())));
+    static SEEN: OnceLock<Mutex<HashSet<(usize, u32, u64)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
-    let frame = crate::queue::presented();
-    if seen.0 != frame {
-        seen.0 = frame;
-        seen.1.clear();
+    if seen.len() >= 32768 {
+        return false;
     }
-    seen.1.insert((index, address))
+    // The host heap pointer is part of the key: a title can release a heap and
+    // land another at the same title address, which is the same ABA the
+    // descriptor-heap binding has to guard against.
+    seen.insert((heap, index, address))
 }
 
 impl State {
@@ -589,7 +590,7 @@ impl State {
                             // into the bound heap (`createHandleFromHeap`); the
                             // slot must hold our view, and only the used-resource
                             // entries are mirrored otherwise.
-                            if u.root != RootType::Table {
+                            {
                                 if let (Some(&Root::View(address)), Some(heap)) = (
                                     self.roots_ref(compute).get(usize::from(u.slot)),
                                     (self.heaps[0] != 0).then(|| {
@@ -598,8 +599,11 @@ impl State {
                                 ) {
                                     if let Some(host) = heap.host() {
                                         let index = v / 32;
-                                        if index < host.count() && mirror_once(index, address) {
-                                            let _ = host.mirror(index, address, !compute);
+                                        if index < host.count() {
+                                            let filled = host.describe_slot(index).is_some();
+                                            if !filled || mirror_once(host as *const _ as usize, index, address) {
+                                                let _ = host.mirror(index, address, !compute);
+                                            }
                                         }
                                     }
                                 }
