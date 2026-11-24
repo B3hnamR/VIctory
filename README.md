@@ -124,6 +124,37 @@ hangs before the black region is reached again.
 Next step: give dynamically indexed table slots a binding, and give the record
 SRV a host view, rather than a scheduler stall.
 
+### Stacked PR results (branch `stack/pr1023-1019-1015`)
+
+Built on upstream PR #1023's base, which already carries the merged lane-mask
+work. Each row is one 6-minute run on the same machine; the sequence depth is
+what the title presented, verified from captured PNGs.
+
+| Build | Furthest presented content | Outcome |
+|---|---|---|
+| earlier local stack | Vice City card, then black with audio | `DXGI_ERROR_DEVICE_HUNG` |
+| [#1023](https://github.com/Marvisak/VIctory/pull/1023) alone | Lucia character art | `DXGI_ERROR_DEVICE_HUNG` |
+| #1023 + [#1019](https://github.com/Marvisak/VIctory/pull/1019) + [#1015](https://github.com/Marvisak/VIctory/pull/1015) | credit page with rendered art; the roll continued past a black transition | `DXGI_ERROR_DEVICE_HUNG` |
+
+The black frames are now a transition **between credit pages**, not the end of
+the sequence. Nothing here is gameplay.
+
+#1023 does what the wait evidence predicted: in the traced run a queue was
+held on a real unsatisfied 64-bit wait (`0xd0417fe00`, reference 1945,
+comparison 7) and reported it instead of hanging silently. In the same run the
+device was removed at op 42, a graphics root CBV bind, in a list whose table
+carries `Srv s3+0: Descriptor` — the direct heap path, which is what #1019 was
+aimed at. That #1019 moved the sequence further supports the diagnosis without
+closing it.
+
+#1015 and #1019 were applied with a three-way merge; #1015 needed its
+`nonuniform` argument supplied at two call sites, which this branch passes as
+`true` for descriptor-chosen-by-control-flow.
+
+Next: trace whether that op-42 slot is populated with this stack. If it is,
+the hang has moved; if it is not, dynamically indexed heap slots still need a
+binding.
+
 [The offline analyzer](tools/trace_buffer_readers.py) accepts experimental
 VIctory logs containing `wait neighbor` and `writer event` markers. It compares
 title addresses only within one frame and strictly later submissions. It labels
