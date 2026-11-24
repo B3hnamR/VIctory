@@ -452,6 +452,78 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Copies of just one view's bytes, by (start, length): for a view whose
+/// start is not on an element of its host copy (`aligned`). The heap slot
+/// holds the copy; this map only finds it again, so it holds weak references
+/// and the copy goes when the slot is remade.
+static ALIGNED: Mutex<BTreeMap<(u64, u64), std::sync::Weak<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// A copy of `[address, address + len)` that starts at `address` itself, so a
+/// structured view of it can have its elements where the title put them.
+///
+/// A title aligns a resource; the host copy of a buffer starts where the
+/// buffer does, so a view of memory the title placed inside another object
+/// (`View::Placed`) starts at an offset that need not be a multiple of the
+/// view's stride. This copy starts at the view, and the slot that made it
+/// keeps it alive.
+///
+/// Its own refresh copies the 64 KiB pages the title wrote since they were
+/// last copied, straight from title memory: a submission's copy-back runs
+/// before the next submission prepares (`Host::execute` waits for the GPU
+/// before copying back), so by then title memory holds what the GPU wrote in
+/// any copy, and what shaders wrote in this one has gone back there. Copying
+/// from the buffer's copy instead would copy the view's whole range again on
+/// every submission.
+pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let key = (address, len);
+    if let Some(copy) = aligned_existing(address, len) {
+        return Some(copy);
+    }
+    // Views hold hundreds of megabytes in the world; made as a buffer's copy
+    // is, so that shaders may write it (unordered access).
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64))?;
+    crate::host::name(&buffer, || format!("aligned view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    {
+        let mut copies = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        // Another recorder may have published the same range while we allocated.
+        if let Some(existing) = copies.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(existing);
+        }
+        copies.insert(key, Arc::downgrade(&copy));
+    }
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        "aligned view copy made"
+    );
+    Some(copy)
+}
+
+/// The copy `aligned` made for this range, if one is still alive.
+pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, len))
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// How many bytes of `[address, address + len)` lie inside the copy that
+/// starts at `start` of `size` bytes: what a refresh of that copy can bring up
+/// to date. `0` when the range is not inside it at all.
+fn inside(address: u64, len: u64, start: u64, size: u64) -> u64 {
+    let end = start.saturating_add(size);
+    let from = address.max(start);
+    let to = address.saturating_add(len).min(end);
+    to.saturating_sub(from)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -512,6 +584,46 @@ mod memory_wait_tests {
     use crate::timeline::{Op, Timeline};
     use std::sync::atomic::AtomicU64;
 
+    #[test]
+    fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+
+        const THREADS: usize = 8;
+        let values = [[19u32; 14]; 8];
+        for value in &values {
+            let address = value.as_ptr() as u64;
+            let len = size_of_val(value) as u64;
+            let gate = std::sync::Barrier::new(THREADS);
+            let copies = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let gate = &gate;
+                        scope.spawn(move || {
+                            gate.wait();
+                            aligned(address, len).expect("aligned host buffer")
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let refreshed = aligned_existing(address, len).expect("cached copy");
+            refreshed.update(address as usize, len as usize);
+            for copy in copies {
+                assert!(Arc::ptr_eq(&copy, &refreshed), "slot retained a different copy");
+                // SAFETY: the mapped buffer has 56 bytes and refresh has completed.
+                let first = unsafe { copy.data.cast::<u32>().read_unaligned() };
+                assert_eq!(first, value[0]);
+            }
+        }
+    }
+
+    /// A refresh of the aligned copy brings up to date the bytes of the view
+    /// that lie inside it, cut at both ends, and nothing when the range is
+    /// outside it.
     #[test]
     fn copy_back_keeps_a_transient_match_until_after_submission() {
         let (buffer, data) = host()

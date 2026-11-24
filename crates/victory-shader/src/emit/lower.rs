@@ -37,6 +37,15 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Heap handles made with a non-uniform index.
+    #[cfg(test)]
+    pub nonuniform_handles: u32,
+    /// Heap handles annotated as constant buffers.
+    #[cfg(test)]
+    pub cbuffer_handles: u32,
+    /// Whether the program uses wave operations.
+    #[cfg(test)]
+    pub wave_ops: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -900,6 +909,12 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            #[cfg(test)]
+            nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            cbuffer_handles: self.s.cbuffer_handles,
+            #[cfg(test)]
+            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2840,7 +2855,12 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        // A descriptor of no listed kind (one fetched from the heap by
+        // index) that vector buffer loads read, and none write, is an SRV in
+        // the title's heap, not a constant buffer: reading its slot through
+        // a constant buffer handle is a descriptor of the wrong type.
+        let buffer_view = kind.is_none() && self.buffer_loads_only(src);
+        if buffer_view || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -3248,6 +3268,30 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether vector buffer loads (`buffer_load_*`) read descriptor `src`
+    /// and no vector buffer access writes through it (which makes it a UAV).
+    fn buffer_loads_only(&self, src: &Source) -> bool {
+        let mut loads = false;
+        for (&((b, i), sampler), &other) in &self.descriptors {
+            if sampler || other != src {
+                continue;
+            }
+            let Some(inst) = self.x.p.blocks[b].insts.get(i) else {
+                continue;
+            };
+            if !matches!(inst.fields, Fields::Buffer { .. }) {
+                continue;
+            }
+            let name = inst.name();
+            if name.starts_with("buffer_load") || name.starts_with("tbuffer_load") {
+                loads = true;
+            } else {
+                return false;
+            }
+        }
+        loads
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } = src {
@@ -3298,7 +3342,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let h = self.s.heap_handle(self.cur, index, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, true, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -3367,7 +3411,7 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, true, props))
             }
         }
     }
@@ -6933,6 +6977,176 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view() {
+        // A descriptor from the resource heap (s0) at an index from a root
+        // constant (s1), read by a scalar buffer load, then used by nothing
+        // else, by a vector buffer load, or by a vector buffer store. A slot
+        // that vector loads read is a buffer view (an SRV), so the scalar
+        // load must not read it through a constant buffer handle (a
+        // descriptor of the wrong type). A store makes it a UAV, which a
+        // read-only view would not match either: that case is unchanged.
+        #[derive(Clone, Copy)]
+        enum Also {
+            Nothing,
+            Load,
+            Store,
+        }
+        let program = |also: Also| {
+            let mut words = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0x8F06_8501, // s_lshl_b32 s6, s1, 5
+                0xF408_0202,
+                0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF420_0304,
+                0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+                0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+                0x7E02_020C, // v_mov_b32 v1, s12
+            ];
+            match also {
+                Also::Nothing => {}
+                Also::Load => words.extend([
+                    0xE030_1000,
+                    0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 offen
+                    0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+                    0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+                ]),
+                Also::Store => words.extend([
+                    0xE070_1000,
+                    0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+                ]),
+            }
+            words.extend([
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            words
+        };
+        let layout = || {
+            vec![
+                root(RootType::ResourceHeap, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ]
+        };
+        let cbuffers = |also| {
+            lower_with(&program(also), layout(), vec![])
+                .unwrap()
+                .cbuffer_handles
+        };
+        assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
+        assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
+        assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
+    }
+
+    #[test]
+    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
+        // Two buffer descriptors loaded from the table at s0, one picked by
+        // a root constant (s1) with s_cselect_b64 per half, and loaded
+        // through by index and stored to LDS so the load is needed.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        // Both are structured buffers of dwords in the table's range.
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// Tables of 2D textures at s0 and samplers at s1.
+    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let range = |kind, user_data, slot| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: if kind == ResourceType::Sampler { 4 } else { 8 },
+            user_data,
+            slot,
+        };
+        (
+            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+            vec![
+                range(ResourceType::Srv, 0, 0),
+                range(ResourceType::Sampler, 1, 1),
+            ],
+        )
+    }
+
+    #[test]
+    fn waterfall_loops_over_per_lane_descriptors_sample_with_each_lanes_own() {
+        use crate::resource::tests::{
+            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
+        };
+        for (words, wave64) in [
+            (WATERFALL_FETCHED_WAVE32, false),
+            (WATERFALL_FETCHED_WAVE64, true),
+            (WATERFALL_PICKED_WAVE32, false),
+        ] {
+            let (layout, used) = texture_tables();
+            let l = lower_wave(words, layout, used, wave64).unwrap();
+            // The loop's reads of the first lane became each lane's own
+            // dwords: no wave operation is left.
+            assert_eq!(l.nonuniform_handles, 1);
+            assert!(!l.wave_ops);
+        }
+    }
+
+    /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
+    pub(crate) fn texture_and_uav_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let (layout, mut used) = texture_tables();
+        used.push(UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 16,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        });
+        (layout, used)
+    }
+
+    #[test]
+    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
+        use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
+        for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
+            let (layout, used) = texture_and_uav_tables();
+            let l = lower_wave(words, layout, used, false).unwrap();
+            // One image handle, from the join's per-lane heap index.
+            assert_eq!(l.nonuniform_handles, 1);
+            assert!(!l.wave_ops);
+        }
     }
 
     #[test]
