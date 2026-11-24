@@ -807,6 +807,9 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        if std::env::var_os("VICTORY_MIRROR_ALL").is_some() {
+            fresh.extend(used.iter().filter(tables).map(|u| u.slot));
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -846,13 +849,18 @@ impl State {
             selected.sort_unstable();
             selected.dedup();
 
-            let n = entries
+            let mut n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
                 .unwrap_or(0)
                 + 1;
+            // Diagnostics: a shader can reach a slot through an index the
+            // program computes, which no used entry or constant names.
+            if std::env::var_os("VICTORY_MIRROR_ALL").is_some() {
+                n = host.count();
+            }
 
             let last = table.checked_add(u64::from(n - 1) * 32);
             if heap.samplers()

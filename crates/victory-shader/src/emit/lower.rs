@@ -7493,6 +7493,71 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    }
+
+    /// `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` with `soffset`
+    /// (`125` = NULL, `0..105` = SGPR).
+    const fn s_load_dwordx4(dst: u8, base: u8, offset: u32, soffset: u8) -> [u32; 2] {
+        [
+            0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            (soffset as u32) << 25 | (offset & 0x1F_FFFF),
+        ]
+    }
+
+    const fn buffer_load_dword(vdata: u8, srsrc: u8, idxen: bool) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x0C << 18 | (idxen as u32) << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    const fn buffer_store_dword(vdata: u8, srsrc: u8, idxen: bool) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x1C << 18 | (idxen as u32) << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    fn lower_table_views(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        user_sgprs: u8,
+    ) -> Vec<TableView> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: u32::from(user_sgprs) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+        .table_views
+    }
+
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
