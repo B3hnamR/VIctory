@@ -1998,7 +1998,8 @@ fn last_notes(runs: &[&HostList]) -> String {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-            for (n, _) in notes.iter().rev().take(6).rev() {
+            let take = if i + 2 >= runs.len() { notes.len() } else { 6 };
+            for (n, _) in notes.iter().rev().take(take).rev() {
                 text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }
         }
