@@ -72,9 +72,24 @@ On frames 1812 and 1821 the compute writer `91b10a73e48b2192` bound UAVs of
 764 and 22,164 bytes, respectively. On each frame the first recorded overlap
 in a later submission was `17af15c4015cb4b6` at SRV `s0+688`. On frame 1821
 that SRV covered 182,452,224 bytes and the same shader also bound that pool as
-a UAV. A bound view this broad does not identify which elements were accessed.
-The presented frame remained black. The next discriminator is the shader's
-runtime index or a readback of the relevant subrange, not a global queue stall.
+a UAV.
+
+That overlap turned out to be the enclosing allocation, not demonstrated
+access. Disassembling the guest shader puts its first pool read at PC `0x68`:
+the offset is `P + 60` and `P + 64`, where `P` is a byte offset the shader
+loads from its `s1+0` buffer at workgroup index `GroupID.x`. Sampling those
+words at submission, over 674 usable workgroups in 13 black frames, gave pool
+offsets of 95.4-115.3 MB. Every tracked `91b10a73e48b2192` output range sat near
+44.2 MB. **No sampled header or lane-payload address fell inside a tracked
+write.** Those ranges total only 78,152 bytes (0.04%) of the pool, so this
+disqualifies the dependency for the sampled workgroups rather than for the
+shader as a whole. Every sample had at least one surviving lane, so the shader
+was not exiting early.
+
+One branch is still untested: 5,769 of 6,443 workgroups (90%) read a nonzero
+descriptor selector at `P + 40` and then use a separately indexed descriptor,
+not this pool. Resolving that selector is the next step, not a queue stall.
+The presented frames stayed black.
 
 [The offline analyzer](tools/trace_buffer_readers.py) accepts experimental
 VIctory logs containing `wait neighbor` and `writer event` markers. It compares
