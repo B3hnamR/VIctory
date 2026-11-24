@@ -734,6 +734,9 @@ impl<'a> Lower<'a> {
                 }
             } else if !console_lanes && x.native.wave64 && one_wave && s.lds_dwords > 0 && uniform_cf {
                 sync_lds = true;
+            } else if one_wave && total <= 32 {
+                // One wave that fits the host's width needs no 64-lane claim.
+                s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
