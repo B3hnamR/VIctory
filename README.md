@@ -65,8 +65,27 @@ In one trace, 173 command-list memory waits saw a 64-bit value below the
 reference at submission; later submissions wrote the exact requested value at
 the same address in all 173 cases. [XCL's wait decoder](https://github.com/ivall/xcl/blob/8cada26/crates/xcl/src/hle/d3d12x/list_x.rs)
 treats comparison 7 as `>=`. The observations are **not** GPU-instruction-time
-samples or proof that a missed wait caused the black frame. Next: follow a
-buffer from a waiting dispatch to its first scene-color reader.
+samples or proof that a missed wait caused the black frame.
+
+In a separate run we logged the effective buffer ranges bound to shader views.
+On frames 1812 and 1821 the compute writer `91b10a73e48b2192` bound UAVs of
+764 and 22,164 bytes, respectively. On each frame the first recorded overlap
+in a later submission was `17af15c4015cb4b6` at SRV `s0+688`. On frame 1821
+that SRV covered 182,452,224 bytes and the same shader also bound that pool as
+a UAV. A bound view this broad does not identify which elements were accessed.
+The presented frame remained black. The next discriminator is the shader's
+runtime index or a readback of the relevant subrange, not a global queue stall.
+
+[The offline analyzer](tools/trace_buffer_readers.py) accepts experimental
+VIctory logs containing `wait neighbor` and `writer event` markers. It compares
+title addresses only within one frame and strictly later submissions. It labels
+enclosing-resource spans separately from effective views; an absent match does
+not exclude indirect, unmarked, same-submission or cross-frame consumers.
+
+```powershell
+python -B tools/test_trace_buffer_readers.py
+python -B tools/trace_buffer_readers.py <local-diagnostic-log> --frame <frame-number>
+```
 
 ## Upstream status (2026-11-23)
 
