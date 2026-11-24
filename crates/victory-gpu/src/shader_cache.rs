@@ -53,6 +53,10 @@ fn build(max_wave: u32) -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Breadcrumbs change the code; off, the key is what it was.
+                if victory_shader::emit::breadcrumbs() {
+                    bytes.extend_from_slice(b"breadcrumbs");
+                }
                 bytes.extend_from_slice(&max_wave.to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
