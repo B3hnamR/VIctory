@@ -8,7 +8,67 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Fork test results (2026-11-24)
+
+**No playable 3D world was observed on our RTX 3080.** This fork tracks
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory). Its `main` includes
+the wave32 lane-mask implementation from [upstream PR #298](https://github.com/Marvisak/VIctory/pull/298),
+our [seven-case regression](https://github.com/permadiego/VIctory/pull/1), and
+an independent [D3D12 texture-handoff fixture](crates/victory-gpu/src/bin/texture-handoff.rs).
+None of them is a gameplay fix.
+
+**Machine:** Windows 11, Ryzen 7 5800X, 32 GB RAM, RTX 3080 (10 GB), driver 610.88.
+These are individual runs, not benchmarks. FPS measures presentations, including
+loading screens. Memory is process commit / sampled dedicated GPU memory in MiB.
+
+| Project / tested revision | Furthest visible stage | Presentation rate | Commit / VRAM | Observed failure |
+|---|---|---|---|---|
+| [VIctory `ffe310e`](https://github.com/Marvisak/VIctory/commit/ffe310e) | Vice City title card, then black with audio | 27.1 FPS (2,047 intervals / 75.49 s during loading) | 22,174 / 8,509 | `DXGI_ERROR_DEVICE_HUNG` |
+| [XCL `8cada26`](https://github.com/ivall/xcl/commit/8cada26) | Illustrated loading screen; no automated input verified | 26.0 FPS (7,920 presents / 304.89 s) | 16,510 / 7,337 | `DXGI_ERROR_DEVICE_HUNG` |
+| [XCL `47efa2e`](https://github.com/ivall/xcl/commit/47efa2e) | Illustrated loading screen; one verified Enter at the player picker | 11.4 FPS (1,700 presents / 148.76 s) | 28,100 / 7,859 | `0xC0000005`, null write. Last complete image was 41.5 s before exit. |
+
+### Reproduce without game files
+
+```powershell
+cargo test --profile diag -p victory-shader --lib wave32_spilled_mask_guards_the_restored_lanes
+$env:VICTORY_HANDOFF_ADAPTER = 'RTX 3080' # Optional: substring of the Windows adapter name
+cargo run --profile diag -p victory-gpu --bin texture-handoff
+```
+
+The shader regression checks the guard *after* restoring the mask, not just
+whether translation succeeds. It failed on the parent (`ffe310e`) and passed on
+the PR head (`54f97db`); with the added regression, the shader library suite
+passed 121 tests with one benchmark ignored. Two previously rejected pixel
+shaders emitted valid DXIL on that PR head. Their binaries are not distributed.
+
+The hardware fixture uses two D3D12 queues, synthetic patterns and a bounded
+fence wait. On the RTX 3080 the early read returned the old pattern, the
+ordered read returned the new pattern, and the wrong texture returned the decoy:
+**1,024/1,024 texels matched in each case**. The test design draws on
+[Xbox2Windows' ordered/early readback](https://github.com/R0Y00/Xbox2Windows/blob/3c6273ac1/tests/vm_copy_queue_check.cpp)
+and [stale texture control](https://github.com/R0Y00/Xbox2Windows/blob/3c6273ac1/tests/compute_mesh_texture_check.py).
+We reviewed those sources; we did not run Xbox2Windows against the game.
+
+### Experimental renderer findings
+
+The following measurements used a **separate local integration**, not this
+fork's `main`: VIctory [#439](https://github.com/Marvisak/VIctory/pull/439)
+(wave width), [#704](https://github.com/Marvisak/VIctory/pull/704) (buffer stride),
+[#571](https://github.com/Marvisak/VIctory/pull/571) (shared-memory writes),
+and [#638](https://github.com/Marvisak/VIctory/pull/638) (producer tracing).
+Both repaired pixel pipelines were accepted and submitted in-game. An intermediate
+color target showed poles and fencing, but the presented image remained black.
+In a pass-time capture, two full-resolution inputs were all zero before the
+final color pass; its output peaked at 4/1023 per RGB channel.
+
+In one trace, 173 command-list memory waits saw a 64-bit value below the
+reference at submission; later submissions wrote the exact requested value at
+the same address in all 173 cases. [XCL's wait decoder](https://github.com/ivall/xcl/blob/8cada26/crates/xcl/src/hle/d3d12x/list_x.rs)
+treats comparison 7 as `>=`. The observations are **not** GPU-instruction-time
+samples or proof that a missed wait caused the black frame. Next: follow a
+buffer from a waiting dispatch to its first scene-color reader.
+
+## Upstream status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
