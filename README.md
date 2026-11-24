@@ -86,10 +86,40 @@ disqualifies the dependency for the sampled workgroups rather than for the
 shader as a whole. Every sample had at least one surviving lane, so the shader
 was not exiting early.
 
-One branch is still untested: 5,769 of 6,443 workgroups (90%) read a nonzero
-descriptor selector at `P + 40` and then use a separately indexed descriptor,
-not this pool. Resolving that selector is the next step, not a queue stall.
-The presented frames stayed black.
+One branch is still untested in the pool probe: 5,769 of 6,443 workgroups (90%)
+read a nonzero selector at `P + 40` and then fetch a descriptor through it.
+
+Disassembling that branch resolves what the selector is. It is a descriptor
+**window index**: the shader loads an 8-byte record from a root SRV
+(`space 2, register 0`) at `selector * 8`, takes the record's second word, and
+uses `word & 0x0FFFFFFF` (minus one, zero meaning "use the selector") as a
+`createHandleFromHeap` index, with `word >> 28` as an offset inside the element.
+With that, the sampled dispatches were measured directly:
+
+- The bound table starts at slot 0 of a heap with 868,928 slots.
+- The pool slot itself (slot 86) **has** a title view — a passing control for
+  the probe.
+- Every sampled selector resolved to slots around 106,000-122,000, and on all
+  sampled workgroups **neither the host nor the title had a view there**: 543
+  host samples and 9 title samples, all empty.
+
+The descriptor record read could not be resolved at all: the translated program
+records no root SRVs, and the dispatch's root arguments are
+`[Table, Table, Constants([0])]`, so the `space 2, register 0` SRV the record
+comes from has no host binding. An unreadable record leaves the slot at the raw
+selector, which is exactly an empty slot. That is why [PR #568](https://github.com/Marvisak/VIctory/pull/568)
+is the right shape of fix (a null of the right kind instead of a null
+`Texture2D`), and also why it cannot be enough on its own: a correctly typed
+null still reads zero.
+
+**#568 stacked on the lane-mask fix (isolated tree):** 3 runs, 84-135 s each,
+each ended in `DXGI_ERROR_DEVICE_HUNG` during the first world submission of 33
+lists. The frames reached (1-2048) were the same illustrated loading artwork as
+before, so no visual change was observed at those points. The world submission
+hangs before the black region is reached again.
+
+Next step: give dynamically indexed table slots a binding, and give the record
+SRV a host view, rather than a scheduler stall.
 
 [The offline analyzer](tools/trace_buffer_readers.py) accepts experimental
 VIctory logs containing `wait neighbor` and `writer event` markers. It compares
