@@ -99,9 +99,12 @@ With that, the sampled dispatches were measured directly:
 - The bound table starts at slot 0 of a heap with 868,928 slots.
 - The pool slot itself (slot 86) **has** a title view — a passing control for
   the probe.
-- Every sampled selector resolved to slots around 106,000-122,000, and on all
-  sampled workgroups **neither the host nor the title had a view there**: 543
-  host samples and 9 title samples, all empty.
+- Every sampled selector resolved to slots around 100,000-122,000, and the
+  host had **no view at any of them** (543 samples). An earlier probe read the
+  title descriptor from the host heap's address instead of the title heap's
+  base and reported the title empty too; after fixing the base, the same slots
+  hold **valid title view records** (`[tag, view index, generation 1]`), so
+  the title populated them and the host never mirrored them.
 
 The descriptor record read could not be resolved at all: the translated program
 records no root SRVs, and the dispatch's root arguments are
