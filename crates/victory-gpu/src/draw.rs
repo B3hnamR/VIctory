@@ -567,9 +567,31 @@ impl State {
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None if u.root == victory_shader::emit::BREADCRUMB_ROOT => self.breadcrumb_slot(),
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
-                }
+                        None => {
+                            let v = self.user_value(compute, u.slot, u.root, u.dword);
+                            // A root descriptor reaches the shader as an index
+                            // into the bound heap (`createHandleFromHeap`); the
+                            // slot must hold our view, and only the used-resource
+                            // entries are mirrored otherwise.
+                            if u.root != RootType::Table {
+                                if let (Some(&Root::View(address)), Some(heap)) = (
+                                    self.roots_ref(compute).get(usize::from(u.slot)),
+                                    (self.heaps[0] != 0).then(|| {
+                                        crate::descriptor::heap(self.heaps[0] as This)
+                                    }),
+                                ) {
+                                    if let Some(host) = heap.host() {
+                                        let index = v / 32;
+                                        if index < host.count() {
+                                            let _ = host.mirror(index, address, !compute);
+                                        }
+                                    }
+                                }
+                            }
+                            v
+                        }
+                };
+            }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
